@@ -1,0 +1,4 @@
+telethon>=1.36
+python-dotenv>=1.0
+httpx>=0.27
+web3>=6.15
