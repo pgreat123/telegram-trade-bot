@@ -51,8 +51,12 @@ ERC20_ABI = [
     },
 ]
 
-SCRATCH_HOLDER = Web3.to_checksum_address("0x000000000000000000000000000000000000b1")
-SCRATCH_RECIPIENT = Web3.to_checksum_address("0x000000000000000000000000000000000000b2")
+# Built via zero-padded hex formatting (not hand-typed) so the length is
+# guaranteed correct -- an EVM address must be exactly 40 hex chars after
+# "0x"; a manually-typed string of zeros is one keystroke away from being
+# wrong, which is exactly what happened here previously (import-time crash).
+SCRATCH_HOLDER = Web3.to_checksum_address(f"0x{0xb1:040x}")
+SCRATCH_RECIPIENT = Web3.to_checksum_address(f"0x{0xb2:040x}")
 PROBE_AMOUNT = 10**18  # 1 whole token unit -- fine for a pass/fail transfer check regardless of actual decimals
 
 
