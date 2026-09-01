@@ -23,6 +23,14 @@ logging.basicConfig(
 )
 log = logging.getLogger("listener")
 
+# Some scanner bots post a message first and only attach its trade
+# buttons/links a moment later via an edit (once pool data finishes
+# loading). Telethon's NewMessage event fires before that edit lands, so we
+# also listen for MessageEdited and re-run the same parsing logic on it.
+# This set stops the same message from ever triggering on_signal twice
+# (e.g. new -> edited-with-buttons -> edited-again-with-updated-stats).
+_actioned_message_ids: set[int] = set()
+
 
 def _extract_urls(message) -> list[str]:
     """
@@ -34,7 +42,8 @@ def _extract_urls(message) -> list[str]:
         "Trade on based_eth_bot") — accessed via each button's `.url`
 
     Some "EARLY CALL" style messages put the contract address only in one
-    of these (e.g. a based_eth_bot deep link), never in the visible text.
+    of these (e.g. a based_eth_bot deep link), never in the visible text —
+    and sometimes only after the message is edited in, not on first send.
     """
     urls: list[str] = []
 
@@ -50,6 +59,31 @@ def _extract_urls(message) -> list[str]:
                 urls.append(url)
 
     return urls
+
+
+async def _handle_message(event, channel_name: str, on_signal, label: str = "new message"):
+    raw_text = event.raw_text or ""
+    log.info(f"[{channel_name}] {label}: {raw_text[:120]!r}")
+
+    button_urls = _extract_urls(event.message)
+    if button_urls:
+        log.info(f"  -> found {len(button_urls)} linked url(s) in message")
+
+    signal = parse_message(raw_text, source_channel=channel_name, button_urls=button_urls)
+    if signal is None:
+        log.info("  -> no actionable signal parsed from this message")
+        return
+
+    message_id = event.message.id
+    if signal.token_address and message_id in _actioned_message_ids:
+        log.info("  -> signal already actioned for this message id, skipping duplicate")
+        return
+
+    if signal.token_address:
+        _actioned_message_ids.add(message_id)
+
+    log.info(f"  -> parsed signal: {signal}")
+    await on_signal(signal)
 
 
 async def run_listener(on_signal):
@@ -80,22 +114,14 @@ async def run_listener(on_signal):
     )
 
     @client.on(events.NewMessage(chats=settings.telegram.channels))
-    async def handler(event):
-        raw_text = event.raw_text or ""
+    async def new_message_handler(event):
         channel_name = getattr(event.chat, "username", None) or str(event.chat_id)
-        log.info(f"[{channel_name}] new message: {raw_text[:120]!r}")
+        await _handle_message(event, channel_name, on_signal, label="new message")
 
-        button_urls = _extract_urls(event.message)
-        if button_urls:
-            log.info(f"  -> found {len(button_urls)} linked url(s) in message")
-
-        signal = parse_message(raw_text, source_channel=channel_name, button_urls=button_urls)
-        if signal is None:
-            log.info("  -> no actionable signal parsed from this message")
-            return
-
-        log.info(f"  -> parsed signal: {signal}")
-        await on_signal(signal)
+    @client.on(events.MessageEdited(chats=settings.telegram.channels))
+    async def edited_message_handler(event):
+        channel_name = getattr(event.chat, "username", None) or str(event.chat_id)
+        await _handle_message(event, channel_name, on_signal, label="message edited")
 
     await client.start()
     log.info(f"Listening on channels: {settings.telegram.channels}")
