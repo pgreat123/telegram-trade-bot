@@ -4,6 +4,11 @@ of these before the risk manager or execution layer ever sees it.
 
 Uses:
   - DexScreener API for liquidity + basic token info (no key required)
+  - An on-chain liquidity fallback (direct Uniswap V3 pool reserve read) for
+    tokens too new for DexScreener to have indexed yet, or on DEXs it
+    doesn't track on this chain. This is ground-truth and can't be spoofed
+    by a scanner bot's self-reported numbers, unlike trusting the Telegram
+    message's stated liquidity.
   - A live eth_call sell-simulation against Uniswap V3 QuoterV2 to catch
     honeypots directly on-chain (no third-party API required — 0x and
     GoPlus do not currently support Robinhood Chain, so this is the
@@ -32,6 +37,9 @@ log = logging.getLogger("safety")
 
 DEXSCREENER_URL = "https://api.dexscreener.com/latest/dex/tokens/{address}"
 GOPLUS_URL = "https://api.gopluslabs.io/api/v1/token_security/{chain_id}"
+ETH_PRICE_URL = "https://api.coingecko.com/api/v3/simple/price?ids=ethereum&vs_currencies=usd"
+
+ZERO_ADDRESS = "0x0000000000000000000000000000000000000000"
 
 # --- Robinhood Chain (4663) canonical Uniswap V3 addresses ---
 # Confirmed against Uniswap/contracts on GitHub:
@@ -68,8 +76,38 @@ QUOTER_V2_ABI = [
     }
 ]
 
+FACTORY_ABI = [
+    {
+        "inputs": [
+            {"internalType": "address", "name": "tokenA", "type": "address"},
+            {"internalType": "address", "name": "tokenB", "type": "address"},
+            {"internalType": "uint24", "name": "fee", "type": "uint24"},
+        ],
+        "name": "getPool",
+        "outputs": [{"internalType": "address", "name": "pool", "type": "address"}],
+        "stateMutability": "view",
+        "type": "function",
+    }
+]
+
+ERC20_BALANCE_ABI = [
+    {
+        "constant": True,
+        "inputs": [{"name": "account", "type": "address"}],
+        "name": "balanceOf",
+        "outputs": [{"name": "", "type": "uint256"}],
+        "stateMutability": "view",
+        "type": "function",
+    }
+]
+
 _w3 = None
 _weth_address = None
+
+# Short-lived in-memory cache for ETH/USD so a burst of checks in quick
+# succession doesn't hammer CoinGecko's free-tier rate limit.
+_eth_price_cache = {"value": None, "fetched_at": 0.0}
+_ETH_PRICE_CACHE_TTL_SECONDS = 60
 
 
 def _get_w3() -> Web3:
@@ -161,6 +199,90 @@ def _simulate_round_trip_sync(token_address: str, probe_wei: int = 10**16) -> di
         }
 
     return {"is_honeypot": False, "error": ""}
+
+
+def _get_max_pool_weth_balance_sync(token_address: str) -> float:
+    """
+    Ground-truth on-chain liquidity read: for each standard fee tier, ask
+    the Uniswap V3 Factory for that pool's address, then read how much WETH
+    the pool itself actually holds (a real ERC20 balanceOf call — can't be
+    faked by a scanner bot's self-reported stats). Returns the WETH amount
+    (in whole WETH, not wei) of whichever fee-tier pool holds the most.
+
+    Only WETH-side balance is read (not the token side) since WETH has a
+    reliable, known USD price; a roughly-balanced V3 pool's total value is
+    therefore approximately 2x this side's value. This is an estimate, not
+    an exact TVL figure — good enough for a pass/fail liquidity gate.
+    """
+    w3 = _get_w3()
+    factory = w3.eth.contract(address=V3_FACTORY_ADDRESS, abi=FACTORY_ABI)
+    token = Web3.to_checksum_address(token_address)
+    weth = _get_weth_address()
+    weth_contract = w3.eth.contract(address=weth, abi=ERC20_BALANCE_ABI)
+
+    best_balance_wei = 0
+    for fee in FEE_TIERS:
+        try:
+            pool_address = factory.functions.getPool(weth, token, fee).call()
+        except Exception:
+            continue
+        if not pool_address or pool_address == ZERO_ADDRESS:
+            continue
+        try:
+            balance = weth_contract.functions.balanceOf(pool_address).call()
+        except Exception:
+            continue
+        if balance > best_balance_wei:
+            best_balance_wei = balance
+
+    return best_balance_wei / 1e18
+
+
+async def _get_eth_usd_price(client: httpx.AsyncClient) -> float | None:
+    """
+    ETH/USD from CoinGecko's public endpoint (no key, no chain-specific
+    address to verify — it's just a price feed, not a contract). Cached
+    briefly so a burst of checks doesn't hit CoinGecko's rate limit.
+    """
+    now = time.time()
+    cached = _eth_price_cache["value"]
+    if cached is not None and (now - _eth_price_cache["fetched_at"]) < _ETH_PRICE_CACHE_TTL_SECONDS:
+        return cached
+
+    try:
+        resp = await client.get(ETH_PRICE_URL, timeout=10)
+        resp.raise_for_status()
+        data = resp.json()
+        price = float(data["ethereum"]["usd"])
+        _eth_price_cache["value"] = price
+        _eth_price_cache["fetched_at"] = now
+        return price
+    except (httpx.HTTPError, KeyError, ValueError) as e:
+        log.warning("Failed to fetch ETH/USD price for on-chain liquidity fallback: %s", e)
+        return cached  # may be None if we've never had a successful fetch
+
+
+async def check_liquidity_onchain(token_address: str, client: httpx.AsyncClient) -> tuple[bool, float, str]:
+    """
+    Fallback liquidity check using the pool's actual on-chain WETH reserve,
+    for tokens DexScreener hasn't indexed yet (very new pools) or doesn't
+    track on this chain/DEX at all. Returns (passed, liquidity_usd, reason).
+    """
+    weth_balance = await asyncio.to_thread(_get_max_pool_weth_balance_sync, token_address)
+    if weth_balance == 0:
+        return False, 0.0, "no on-chain pool found for this token on any standard fee tier"
+
+    eth_price = await _get_eth_usd_price(client)
+    if eth_price is None:
+        return False, 0.0, "could not fetch ETH/USD price to value on-chain liquidity"
+
+    liquidity_usd = weth_balance * 2 * eth_price  # assume roughly balanced pool
+    if liquidity_usd < settings.safety.min_liquidity_usd:
+        return False, liquidity_usd, (
+            f"on-chain liquidity too low (${liquidity_usd:,.0f} < "
+            f"${settings.safety.min_liquidity_usd:,.0f})"
+        )
+    return True, liquidity_usd, ""
 
 
 @dataclass
@@ -281,8 +403,31 @@ def check_token_age(pair_created_at_ms: int) -> tuple[bool, str]:
 async def run_safety_checks(token_address: str) -> SafetyResult:
     async with httpx.AsyncClient() as client:
         liq_ok, liquidity_usd, pair_created_at, liq_reason = await check_liquidity(token_address, client)
+
         if not liq_ok:
-            return SafetyResult(passed=False, reason=liq_reason, liquidity_usd=liquidity_usd)
+            # DexScreener says it's too thin (or has no data at all) — before
+            # failing the token outright, cross-check against the pool's
+            # actual on-chain reserves. This rescues genuinely-liquid tokens
+            # that DexScreener simply hasn't indexed yet (very fresh pools,
+            # or DEXs it doesn't track on this chain), without ever trusting
+            # a caller's self-reported liquidity number.
+            log.info(
+                "DexScreener liquidity check failed for %s (%s) — trying on-chain fallback",
+                token_address, liq_reason,
+            )
+            onchain_ok, onchain_liquidity_usd, onchain_reason = await check_liquidity_onchain(token_address, client)
+            if onchain_ok:
+                log.info(
+                    "On-chain liquidity check passed for %s (~$%.0f) — overriding DexScreener result",
+                    token_address, onchain_liquidity_usd,
+                )
+                liquidity_usd = onchain_liquidity_usd
+            else:
+                return SafetyResult(
+                    passed=False,
+                    reason=f"{liq_reason}; on-chain check also failed: {onchain_reason}",
+                    liquidity_usd=max(liquidity_usd, onchain_liquidity_usd),
+                )
 
         age_ok, age_reason = check_token_age(pair_created_at)
         if not age_ok:

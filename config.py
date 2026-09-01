@@ -86,7 +86,7 @@ class NotifierConfig:
 
 @dataclass
 class SafetyConfig:
-    min_liquidity_usd: float = 3000.0     # skip tokens with thinner pools than this
+    min_liquidity_usd: float = float(os.getenv("MIN_LIQUIDITY_USD", "15000"))  # skip tokens with thinner pools than this
     max_holder_concentration_pct: float = 0.30  # skip if top wallet holds >30% of supply
     require_sell_check: bool = True        # simulate a sell before buying (honeypot check)
     require_renounced_or_locked: bool = True  # deployer must have renounced or locked liquidity
