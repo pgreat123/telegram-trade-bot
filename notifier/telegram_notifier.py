@@ -19,6 +19,7 @@ debug level) so the bot still runs fine without this feature configured.
 Sending never blocks or crashes the trading pipeline: failures are caught
 and logged, never raised.
 """
+import html
 import logging
 
 import httpx
@@ -60,6 +61,12 @@ async def notify(text: str):
 # ---------- pre-formatted event helpers ----------
 # Keeping the formatting here (rather than scattered at call sites) means
 # every call site just passes data, and message wording stays consistent.
+#
+# IMPORTANT: parse_mode is HTML, so any dynamic text that isn't a deliberate
+# <b>/<code> tag we're adding ourselves MUST be html.escape()'d first. A
+# safety-check "reason" string can contain "<" or ">" (e.g. "liquidity too
+# low ($2 < $3,000)") which Telegram's HTML parser otherwise reads as a
+# broken tag and rejects the whole message with a 400.
 
 def _short(addr: str) -> str:
     return addr if len(addr) <= 12 else f"{addr[:6]}...{addr[-4:]}"
@@ -70,7 +77,7 @@ async def notify_buy_executed(token_address: str, amount_usd: float,
     prefix = "🧪 [DRY RUN] Would buy" if dry_run else "✅ BUY executed"
     await notify(
         f"{prefix}\n"
-        f"Token: <code>{_short(token_address)}</code>\n"
+        f"Token: <code>{html.escape(_short(token_address))}</code>\n"
         f"Size: ${amount_usd:.2f}\n"
         f"Liquidity: ${liquidity_usd:,.0f}"
     )
@@ -80,8 +87,8 @@ async def notify_blocked(token_address: str, stage: str, reason: str):
     label = "blocked by risk manager" if stage == "risk" else "blocked by safety check"
     await notify(
         f"🚫 Trade {label}\n"
-        f"Token: <code>{_short(token_address)}</code>\n"
-        f"Reason: {reason}"
+        f"Token: <code>{html.escape(_short(token_address))}</code>\n"
+        f"Reason: {html.escape(reason)}"
     )
 
 
@@ -89,9 +96,9 @@ async def notify_scale_out(symbol: str, fraction: float, reason: str, dry_run: b
     prefix = "🧪 [DRY RUN] Would scale out" if dry_run else "📉 Scaled out"
     await notify(
         f"{prefix}\n"
-        f"Token: <code>{symbol}</code>\n"
+        f"Token: <code>{html.escape(symbol)}</code>\n"
         f"Sold: {fraction:.0%} of original size\n"
-        f"Reason: {reason}"
+        f"Reason: {html.escape(reason)}"
     )
 
 
@@ -99,16 +106,16 @@ async def notify_position_closed(symbol: str, reason: str, pnl_usd: float | None
     if dry_run:
         await notify(
             f"🧪 [DRY RUN] Would close full position\n"
-            f"Token: <code>{symbol}</code>\n"
-            f"Reason: {reason}"
+            f"Token: <code>{html.escape(symbol)}</code>\n"
+            f"Reason: {html.escape(reason)}"
         )
         return
 
     emoji = "🟢" if (pnl_usd or 0) >= 0 else "🔴"
     pnl_line = f"Realized P&L: {emoji} ${pnl_usd:.2f}\n" if pnl_usd is not None else ""
     await notify(
-        f"❌ Position CLOSED\n"
-        f"Token: <code>{symbol}</code>\n"
+        f"{emoji} Position closed\n"
+        f"Token: <code>{html.escape(symbol)}</code>\n"
         f"{pnl_line}"
-        f"Reason: {reason}"
+        f"Reason: {html.escape(reason)}"
     )
