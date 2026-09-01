@@ -10,9 +10,9 @@ after that it reuses a saved session file.
 """
 from telethon import TelegramClient, events
 from telethon.sessions import StringSession
+from telethon.tl.types import MessageEntityTextUrl
 import asyncio
 import logging
-from telethon import TelegramClient, events
 
 from config import settings
 from parser.signal_parser import parse_message
@@ -22,6 +22,34 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(message)s",
 )
 log = logging.getLogger("listener")
+
+
+def _extract_urls(message) -> list[str]:
+    """
+    Pulls every URL referenced by a message, from two places Telethon
+    exposes them separately:
+      - message.entities: hyperlinks applied to plain text (invisible in
+        raw_text) via MessageEntityTextUrl
+      - message.buttons: inline keyboard buttons (e.g. "View on GeckoTerminal",
+        "Trade on based_eth_bot") — accessed via each button's `.url`
+
+    Some "EARLY CALL" style messages put the contract address only in one
+    of these (e.g. a based_eth_bot deep link), never in the visible text.
+    """
+    urls: list[str] = []
+
+    entities = message.entities or []
+    for entity in entities:
+        if isinstance(entity, MessageEntityTextUrl) and entity.url:
+            urls.append(entity.url)
+
+    for row in (message.buttons or []):
+        for button in row:
+            url = getattr(button, "url", None)
+            if url:
+                urls.append(url)
+
+    return urls
 
 
 async def run_listener(on_signal):
@@ -50,7 +78,6 @@ async def run_listener(on_signal):
         settings.telegram.api_id,
         settings.telegram.api_hash,
     )
-    
 
     @client.on(events.NewMessage(chats=settings.telegram.channels))
     async def handler(event):
@@ -58,7 +85,11 @@ async def run_listener(on_signal):
         channel_name = getattr(event.chat, "username", None) or str(event.chat_id)
         log.info(f"[{channel_name}] new message: {raw_text[:120]!r}")
 
-        signal = parse_message(raw_text, source_channel=channel_name)
+        button_urls = _extract_urls(event.message)
+        if button_urls:
+            log.info(f"  -> found {len(button_urls)} linked url(s) in message")
+
+        signal = parse_message(raw_text, source_channel=channel_name, button_urls=button_urls)
         if signal is None:
             log.info("  -> no actionable signal parsed from this message")
             return
